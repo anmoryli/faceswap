@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local runtime logs
+logs/
+*.log
+webui.log
+
+# Generated outputs and uploads
+output/
+uploads/
+
+# Model weights and extracted data
+models/
+*.onnx
+*.npy
+
+# Local binaries and tools
+frp/*.exe
+ngrok/
+nssm/
+
+# Temporary media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# OS / editor files
+.DS_Store
+Thumbs.db
