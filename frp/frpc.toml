@@ -1,0 +1,12 @@
+# frp 客户端配置（本地 Windows 端）
+# 文件位置：d:/Downloads/faceswap/frp/frpc.toml
+
+serverAddr = "175.24.205.213"
+serverPort = 7000
+
+[[proxies]]
+name = "faceswap-web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 7860
+remotePort = 7860
