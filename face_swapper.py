@@ -64,7 +64,7 @@ def nms(dets, thresh):
 # ─────────────────────────────────────────────
 
 class FaceDetector:
-    def __init__(self, model_path, input_size=(640, 640), det_thresh=0.5, nms_thresh=0.4):
+    def __init__(self, model_path, input_size=(640, 640), det_thresh=0.45, nms_thresh=0.4):
         self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
         self.input_size = input_size
         self.det_thresh = det_thresh
@@ -260,12 +260,30 @@ class GFPGANEnhancer:
         return result.clip(0, 255).astype(np.uint8)
 
 
+def reinhard_color_transfer(source_bgr, target_bgr):
+    """将 source 的整体肤色和明暗统计迁移到 target，提升融合自然度。"""
+    src_lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    for ch in range(3):
+        src_mean, src_std = cv2.meanStdDev(src_lab[:, :, ch])
+        tgt_mean, tgt_std = cv2.meanStdDev(tgt_lab[:, :, ch])
+        src_mean = float(src_mean[0][0])
+        src_std = float(src_std[0][0]) + 1e-6
+        tgt_mean = float(tgt_mean[0][0])
+        tgt_std = float(tgt_std[0][0]) + 1e-6
+        tgt_lab[:, :, ch] = (tgt_lab[:, :, ch] - tgt_mean) * (src_std / tgt_std) + src_mean
+
+    tgt_lab = np.clip(tgt_lab, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(tgt_lab, cv2.COLOR_LAB2BGR)
+
+
 # ─────────────────────────────────────────────
 # 主流程封装
 # ─────────────────────────────────────────────
 
 class FaceSwapPipeline:
-    def __init__(self, use_enhancer=True):
+    def __init__(self, use_enhancer=True, det_thresh=0.45):
         det_path  = os.path.join(MODELS_DIR, 'det_10g.onnx')
         emb_path  = os.path.join(MODELS_DIR, 'w600k_r50.onnx')
         swap_path = os.path.join(MODELS_DIR, 'inswapper_128.onnx')
@@ -275,7 +293,7 @@ class FaceSwapPipeline:
             if not os.path.exists(p):
                 raise FileNotFoundError(f'模型文件不存在: {p}')
 
-        self.detector  = FaceDetector(det_path)
+        self.detector  = FaceDetector(det_path, det_thresh=det_thresh)
         self.embedder  = FaceEmbedder(emb_path)
         self.swapper   = FaceSwapModel(swap_path)
         self.use_enhancer = use_enhancer and os.path.exists(enh_path)
@@ -301,7 +319,7 @@ class FaceSwapPipeline:
         face = norm_crop(source_img, kps, image_size=112)
         return self.embedder.get_embedding(face)
 
-    def swap_image(self, source_img, target_img, progress_cb=None):
+    def swap_image(self, source_img, target_img, progress_cb=None, enable_enhancement=None, max_faces=None):
         src_emb = self.get_source_embedding(source_img)
         if src_emb is None:
             raise ValueError('来源图片中未检测到人脸')
@@ -310,14 +328,24 @@ class FaceSwapPipeline:
         if len(dets) == 0:
             raise ValueError('目标图片中未检测到人脸')
 
+        if enable_enhancement is None:
+            enable_enhancement = self.use_enhancer
+
+        if max_faces is not None and len(dets) > max_faces:
+            areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
+            keep = np.argsort(-areas)[:max_faces]
+            dets = dets[keep]
+            kps_all = kps_all[keep]
+
         result = target_img.copy()
+        total_faces = max(len(dets), 1)
         for i, (det, kps) in enumerate(zip(dets, kps_all)):
-            result = self._swap_single_face(result, src_emb, kps)
+            result = self._swap_single_face(result, src_emb, kps, enable_enhancement=enable_enhancement)
             if progress_cb:
-                progress_cb((i + 1) / len(dets))
+                progress_cb((i + 1) / total_faces)
         return result
 
-    def _swap_single_face(self, img, src_emb, kps):
+    def _swap_single_face(self, img, src_emb, kps, enable_enhancement=True):
         """对图中单张人脸执行换脸并贴回原图（官方 inswapper 贴回逻辑）"""
         h, w = img.shape[:2]
 
@@ -328,12 +356,15 @@ class FaceSwapPipeline:
         # 2. InSwapper 换脸
         fake_bgr, aimg = self.swapper.swap(aimg, src_emb)
 
-        # 3. 可选 GFPGAN 增强（512px 后 resize 回 128）
-        if self.use_enhancer and self.enhancer is not None:
-            enhanced = self.enhancer.enhance(fake_bgr)  # 512x512
-            fake_bgr = cv2.resize(enhanced, (128, 128))
+        # 3. 色彩迁移，减少贴回后的肤色割裂
+        fake_bgr = reinhard_color_transfer(aimg, fake_bgr)
 
-        # 4. 官方贴回逻辑：用 fake_diff 差值 mask + img_white 椭圆 mask 融合
+        # 4. 可选 GFPGAN 增强（512px 后 resize 回 128）
+        if enable_enhancement and self.enhancer is not None:
+            enhanced = self.enhancer.enhance(fake_bgr)  # 512x512
+            fake_bgr = cv2.resize(enhanced, (128, 128), interpolation=cv2.INTER_CUBIC)
+
+        # 5. 贴回原图
         result = self._paste_back(img, fake_bgr, aimg, M)
         return result
 
@@ -369,20 +400,23 @@ class FaceSwapPipeline:
         fake_diff_back = cv2.dilate(fake_diff_back, np.ones((2, 2), np.uint8), iterations=1)
         fake_diff_back = cv2.GaussianBlur(fake_diff_back, (11, 11), 0)
 
-        # 综合两个 mask
-        img_mask_final = (img_mask / 255.0)
-        # diff mask 用于增强换脸区内的覆盖（乘法综合）
-        # 可单独只用 img_mask，更稳定
+        # 综合两个 mask：img_mask 负责平滑边缘，fake_diff_back 负责增强真实换脸区域覆盖
+        img_mask_final = img_mask / 255.0
+        diff_mask = (fake_diff_back / 255.0) * 0.35
+        img_mask_final = np.clip(np.maximum(img_mask_final, diff_mask), 0.0, 1.0)
         img_mask_final = img_mask_final.reshape(H, W, 1)
 
         result = (img_mask_final * img_fake_back.astype(np.float32) +
                   (1 - img_mask_final) * target_img.astype(np.float32))
         return result.clip(0, 255).astype(np.uint8)
 
-    def swap_video(self, source_img, video_path, output_path, progress_cb=None):
+    def swap_video(self, source_img, video_path, output_path, progress_cb=None, enable_enhancement=None, max_faces=1):
         src_emb = self.get_source_embedding(source_img)
         if src_emb is None:
             raise ValueError('来源图片中未检测到人脸')
+
+        if enable_enhancement is None:
+            enable_enhancement = False if self.enhancer is not None else self.use_enhancer
 
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
@@ -399,9 +433,15 @@ class FaceSwapPipeline:
             if not ret:
                 break
             dets, kps_all = self.detector.detect(frame)
+            if max_faces is not None and len(dets) > max_faces:
+                areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
+                keep = np.argsort(-areas)[:max_faces]
+                dets = dets[keep]
+                kps_all = kps_all[keep]
+
             result = frame.copy()
             for det, kps in zip(dets, kps_all):
-                result = self._swap_single_face(result, src_emb, kps)
+                result = self._swap_single_face(result, src_emb, kps, enable_enhancement=enable_enhancement)
             out.write(result)
             frame_idx += 1
             if progress_cb and total > 0:
