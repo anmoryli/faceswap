@@ -6,6 +6,7 @@ __pycache__/
 logs/
 *.log
 webui.log
+email_config.json
 
 # Generated outputs and uploads
 output/

@@ -7,6 +7,8 @@ import os
 import cv2
 import numpy as np
 import onnxruntime as ort
+import threading
+from queue import Queue
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
 
@@ -410,6 +412,67 @@ class FaceSwapPipeline:
                   (1 - img_mask_final) * target_img.astype(np.float32))
         return result.clip(0, 255).astype(np.uint8)
 
+    def _detect_with_scale(self, frame, detect_scale=1.0):
+        if detect_scale is None or detect_scale >= 0.999:
+            return self.detector.detect(frame)
+        h, w = frame.shape[:2]
+        sw = max(64, int(w * detect_scale))
+        sh = max(64, int(h * detect_scale))
+        small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
+        dets, kps_all = self.detector.detect(small)
+        if len(dets) == 0:
+            return dets, kps_all
+        dets = dets.copy()
+        kps_all = kps_all.copy()
+        dets[:, :4] /= detect_scale
+        kps_all /= detect_scale
+        return dets, kps_all
+
+    def _kps_to_dets(self, kps_all, frame_shape):
+        if kps_all is None or len(kps_all) == 0:
+            return [], []
+        h, w = frame_shape[:2]
+        dets = []
+        for kps in kps_all:
+            x1, y1 = kps.min(axis=0)
+            x2, y2 = kps.max(axis=0)
+            bw = x2 - x1
+            bh = y2 - y1
+            pad_x = bw * 0.5
+            pad_y = bh * 0.7
+            dets.append([
+                max(0.0, x1 - pad_x),
+                max(0.0, y1 - pad_y),
+                min(float(w - 1), x2 + pad_x),
+                min(float(h - 1), y2 + pad_y),
+                1.0,
+            ])
+        return np.asarray(dets, dtype=np.float32), np.asarray(kps_all, dtype=np.float32)
+
+    def _track_keypoints(self, prev_gray, gray, prev_kps_all):
+        if prev_gray is None or gray is None or prev_kps_all is None or len(prev_kps_all) == 0:
+            return None
+        pts = prev_kps_all.reshape(-1, 1, 2).astype(np.float32)
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray,
+            gray,
+            pts,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if next_pts is None or status is None:
+            return None
+        status = status.reshape(-1)
+        next_pts = next_pts.reshape(prev_kps_all.shape)
+        face_status = status.reshape(-1, 5)
+        good_faces = face_status.mean(axis=1) >= 0.8
+        if not np.any(good_faces):
+            return None
+        tracked = next_pts[good_faces]
+        return tracked.astype(np.float32)
+
     def swap_video(self, source_img, video_path, output_path, progress_cb=None, enable_enhancement=None, max_faces=1):
         src_emb = self.get_source_embedding(source_img)
         if src_emb is None:
@@ -423,30 +486,98 @@ class FaceSwapPipeline:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not cap.isOpened():
+            raise ValueError('无法打开视频文件')
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (fw, fh))
 
+        read_queue = Queue(maxsize=12)
+        write_queue = Queue(maxsize=12)
+        errors = {'reader': None, 'writer': None}
+
+        def reader():
+            try:
+                idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    read_queue.put((idx, frame))
+                    idx += 1
+            except Exception as e:
+                errors['reader'] = e
+            finally:
+                read_queue.put(None)
+
+        def writer():
+            try:
+                while True:
+                    item = write_queue.get()
+                    if item is None:
+                        break
+                    _, frame = item
+                    out.write(frame)
+            except Exception as e:
+                errors['writer'] = e
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        reader_thread.start()
+        writer_thread.start()
+
+        detect_scale = 0.75 if max(fw, fh) >= 960 else 1.0
+        frame_skip = 2 if not enable_enhancement else 1
+        prev_gray = None
+        prev_kps_all = None
         frame_idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            dets, kps_all = self.detector.detect(frame)
-            if max_faces is not None and len(dets) > max_faces:
-                areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
-                keep = np.argsort(-areas)[:max_faces]
-                dets = dets[keep]
-                kps_all = kps_all[keep]
+        last_detect_frame = -999999
 
-            result = frame.copy()
-            for det, kps in zip(dets, kps_all):
-                result = self._swap_single_face(result, src_emb, kps, enable_enhancement=enable_enhancement)
-            out.write(result)
-            frame_idx += 1
-            if progress_cb and total > 0:
-                progress_cb(frame_idx / total)
+        try:
+            while True:
+                item = read_queue.get()
+                if item is None:
+                    break
+                _, frame = item
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        cap.release()
-        out.release()
+                use_tracking = prev_gray is not None and prev_kps_all is not None and (frame_idx - last_detect_frame) < frame_skip
+                if use_tracking:
+                    tracked_kps = self._track_keypoints(prev_gray, gray, prev_kps_all)
+                    if tracked_kps is not None and len(tracked_kps) > 0:
+                        dets, kps_all = self._kps_to_dets(tracked_kps, frame.shape)
+                    else:
+                        dets, kps_all = self._detect_with_scale(frame, detect_scale=detect_scale)
+                        last_detect_frame = frame_idx
+                else:
+                    dets, kps_all = self._detect_with_scale(frame, detect_scale=detect_scale)
+                    last_detect_frame = frame_idx
+
+                if max_faces is not None and len(dets) > max_faces:
+                    areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
+                    keep = np.argsort(-areas)[:max_faces]
+                    dets = dets[keep]
+                    kps_all = kps_all[keep]
+
+                result = frame.copy()
+                for _, kps in zip(dets, kps_all):
+                    result = self._swap_single_face(result, src_emb, kps, enable_enhancement=enable_enhancement)
+                write_queue.put((frame_idx, result))
+
+                prev_gray = gray
+                prev_kps_all = np.asarray(kps_all, dtype=np.float32) if len(kps_all) > 0 else None
+                frame_idx += 1
+                if progress_cb and total > 0:
+                    progress_cb(frame_idx / total)
+
+            write_queue.put(None)
+            reader_thread.join()
+            writer_thread.join()
+            if errors['reader']:
+                raise errors['reader']
+            if errors['writer']:
+                raise errors['writer']
+        finally:
+            cap.release()
+            out.release()
         return output_path
